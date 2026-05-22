@@ -12,6 +12,35 @@
 use std::error::Error;
 use std::fmt;
 
+// ─── Constructor errors ──────────────────────────────────────────────────────
+
+/// Errors returned when constructing a [`TurboQuantIndex`](crate::TurboQuantIndex)
+/// or [`IdMapIndex`](crate::IdMapIndex) with invalid parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstructError {
+    /// `bit_width` is not one of the supported values (2, 3, or 4).
+    InvalidBitWidth(usize),
+    /// `dim` is not a positive multiple of 8.
+    InvalidDim(usize),
+}
+
+impl fmt::Display for ConstructError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBitWidth(bw) => {
+                write!(f, "bit_width must be 2, 3, or 4, got {bw}")
+            }
+            Self::InvalidDim(dim) => {
+                write!(f, "dim must be a positive multiple of 8, got {dim}")
+            }
+        }
+    }
+}
+
+impl Error for ConstructError {}
+
+// ─── Add-path errors ─────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddError {
     /// Batch dim does not match the index's already-locked dim.

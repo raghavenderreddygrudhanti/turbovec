@@ -63,7 +63,7 @@ fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 
 #[test]
 fn new_lazy_starts_with_no_dim() {
-    let idx = TurboQuantIndex::new_lazy(4);
+    let idx = TurboQuantIndex::new_lazy(4).unwrap();
     assert_eq!(idx.dim_opt(), None);
     assert_eq!(idx.dim(), 0, "dim() returns 0 as sentinel");
     assert_eq!(idx.len(), 0);
@@ -72,7 +72,7 @@ fn new_lazy_starts_with_no_dim() {
 
 #[test]
 fn add_2d_locks_dim_on_first_call() {
-    let mut idx = TurboQuantIndex::new_lazy(4);
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
     let data = unit_vectors(3, DIM, 0xA00D_0001);
     idx.add_2d(&data, DIM).unwrap();
     assert_eq!(idx.dim_opt(), Some(DIM));
@@ -81,7 +81,7 @@ fn add_2d_locks_dim_on_first_call() {
 
 #[test]
 fn add_2d_subsequent_calls_must_match_dim() {
-    let mut idx = TurboQuantIndex::new_lazy(4);
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
     let data1 = unit_vectors(2, DIM, 0xA00D_0002);
     idx.add_2d(&data1, DIM).unwrap();
     let data2 = unit_vectors(2, DIM, 0xA00D_0003);
@@ -91,7 +91,7 @@ fn add_2d_subsequent_calls_must_match_dim() {
 
 #[test]
 fn add_2d_rejects_dim_change() {
-    let mut idx = TurboQuantIndex::new_lazy(4);
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
     let data = unit_vectors(1, DIM, 0xA00D_0004);
     idx.add_2d(&data, DIM).unwrap();
     let wrong = unit_vectors(1, DIM * 2, 0xA00D_0005);
@@ -108,14 +108,14 @@ fn add_2d_rejects_dim_change() {
 #[test]
 #[should_panic(expected = "dim is not set")]
 fn plain_add_panics_on_lazy_uncommitted() {
-    let mut idx = TurboQuantIndex::new_lazy(4);
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
     let data = unit_vectors(1, DIM, 0xA00D_0006);
     idx.add(&data);
 }
 
 #[test]
 fn search_on_lazy_uncommitted_returns_empty() {
-    let idx = TurboQuantIndex::new_lazy(4);
+    let idx = TurboQuantIndex::new_lazy(4).unwrap();
     let queries = unit_vectors(2, DIM, 0xA00D_0007);
     let res = idx.search(&queries, 5);
     assert_eq!(res.scores.len(), 0);
@@ -125,7 +125,7 @@ fn search_on_lazy_uncommitted_returns_empty() {
 
 #[test]
 fn prepare_on_lazy_uncommitted_is_noop() {
-    let idx = TurboQuantIndex::new_lazy(4);
+    let idx = TurboQuantIndex::new_lazy(4).unwrap();
     idx.prepare(); // should not panic
 }
 
@@ -133,7 +133,7 @@ fn prepare_on_lazy_uncommitted_is_noop() {
 fn write_load_round_trip_lazy_uncommitted() {
     let tmp = std::env::temp_dir().join("turbovec_lazy_uncommitted.tv");
     {
-        let idx = TurboQuantIndex::new_lazy(4);
+        let idx = TurboQuantIndex::new_lazy(4).unwrap();
         idx.write(&tmp).unwrap();
     }
     let loaded = TurboQuantIndex::load(&tmp).unwrap();
@@ -148,7 +148,7 @@ fn write_load_round_trip_eager_index_still_works() {
     // Regression: the dim=0 sentinel logic must not affect normal indexes.
     let tmp = std::env::temp_dir().join("turbovec_lazy_eager.tv");
     {
-        let mut idx = TurboQuantIndex::new(DIM, 4);
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
         idx.add(&unit_vectors(4, DIM, 0xA00D_0008));
         idx.write(&tmp).unwrap();
     }
@@ -162,7 +162,7 @@ fn write_load_round_trip_eager_index_still_works() {
 fn write_load_round_trip_lazy_after_committed_add() {
     let tmp = std::env::temp_dir().join("turbovec_lazy_committed.tv");
     {
-        let mut idx = TurboQuantIndex::new_lazy(2);
+        let mut idx = TurboQuantIndex::new_lazy(2).unwrap();
         idx.add_2d(&unit_vectors(3, DIM, 0xA00D_0009), DIM).unwrap();
         idx.write(&tmp).unwrap();
     }
@@ -177,7 +177,7 @@ fn write_load_round_trip_lazy_after_committed_add() {
 
 #[test]
 fn id_map_new_lazy_starts_with_no_dim() {
-    let idx = IdMapIndex::new_lazy(4);
+    let idx = IdMapIndex::new_lazy(4).unwrap();
     assert_eq!(idx.dim_opt(), None);
     assert_eq!(idx.dim(), 0);
     assert_eq!(idx.len(), 0);
@@ -185,7 +185,7 @@ fn id_map_new_lazy_starts_with_no_dim() {
 
 #[test]
 fn id_map_add_with_ids_2d_locks_dim() {
-    let mut idx = IdMapIndex::new_lazy(4);
+    let mut idx = IdMapIndex::new_lazy(4).unwrap();
     let data = unit_vectors(3, DIM, 0xA00D_0010);
     let ids: Vec<u64> = vec![10, 20, 30];
     idx.add_with_ids_2d(&data, DIM, &ids).unwrap();
@@ -197,14 +197,14 @@ fn id_map_add_with_ids_2d_locks_dim() {
 #[test]
 #[should_panic(expected = "dim is not set")]
 fn id_map_plain_add_with_ids_panics_on_lazy_uncommitted() {
-    let mut idx = IdMapIndex::new_lazy(4);
+    let mut idx = IdMapIndex::new_lazy(4).unwrap();
     let data = unit_vectors(1, DIM, 0xA00D_0011);
     idx.add_with_ids(&data, &[42]).unwrap();
 }
 
 #[test]
 fn id_map_search_on_lazy_uncommitted_returns_empty() {
-    let idx = IdMapIndex::new_lazy(4);
+    let idx = IdMapIndex::new_lazy(4).unwrap();
     let queries = unit_vectors(1, DIM, 0xA00D_0012);
     let (scores, ids) = idx.search(&queries, 5);
     assert!(scores.is_empty());
@@ -215,7 +215,7 @@ fn id_map_search_on_lazy_uncommitted_returns_empty() {
 fn id_map_write_load_round_trip_lazy_uncommitted() {
     let tmp = std::env::temp_dir().join("turbovec_idmap_lazy_uncommitted.tvim");
     {
-        let idx = IdMapIndex::new_lazy(2);
+        let idx = IdMapIndex::new_lazy(2).unwrap();
         idx.write(&tmp).unwrap();
     }
     let loaded = IdMapIndex::load(&tmp).unwrap();
@@ -230,7 +230,7 @@ fn id_map_write_load_round_trip_lazy_after_committed_add() {
     let tmp = std::env::temp_dir().join("turbovec_idmap_lazy_committed.tvim");
     let ids: Vec<u64> = vec![100, 200, 300];
     {
-        let mut idx = IdMapIndex::new_lazy(4);
+        let mut idx = IdMapIndex::new_lazy(4).unwrap();
         idx.add_with_ids_2d(&unit_vectors(3, DIM, 0xA00D_0013), DIM, &ids).unwrap();
         idx.write(&tmp).unwrap();
     }

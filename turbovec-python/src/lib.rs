@@ -15,13 +15,14 @@ impl TurboQuantIndex {
     /// array's shape.
     #[new]
     #[pyo3(signature = (dim=None, bit_width=4))]
-    fn new(dim: Option<usize>, bit_width: usize) -> Self {
-        Self {
-            inner: match dim {
-                Some(d) => turbovec_core::TurboQuantIndex::new(d, bit_width),
-                None => turbovec_core::TurboQuantIndex::new_lazy(bit_width),
-            },
-        }
+    fn new(dim: Option<usize>, bit_width: usize) -> PyResult<Self> {
+        let inner = match dim {
+            Some(d) => turbovec_core::TurboQuantIndex::new(d, bit_width)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+            None => turbovec_core::TurboQuantIndex::new_lazy(bit_width)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+        };
+        Ok(Self { inner })
     }
 
     fn add(&mut self, vectors: PyReadonlyArray2<f32>) -> PyResult<()> {
@@ -154,13 +155,14 @@ impl IdMapIndex {
     /// `add_with_ids` call, picking up dim from the input array shape.
     #[new]
     #[pyo3(signature = (dim=None, bit_width=4))]
-    fn new(dim: Option<usize>, bit_width: usize) -> Self {
-        Self {
-            inner: match dim {
-                Some(d) => turbovec_core::IdMapIndex::new(d, bit_width),
-                None => turbovec_core::IdMapIndex::new_lazy(bit_width),
-            },
-        }
+    fn new(dim: Option<usize>, bit_width: usize) -> PyResult<Self> {
+        let inner = match dim {
+            Some(d) => turbovec_core::IdMapIndex::new(d, bit_width)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+            None => turbovec_core::IdMapIndex::new_lazy(bit_width)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+        };
+        Ok(Self { inner })
     }
 
     /// Add `n = vectors.shape[0]` vectors with the given external `ids`.

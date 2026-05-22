@@ -7,7 +7,7 @@
 //! use turbovec::TurboQuantIndex;
 //!
 //! // 1536-dim vectors compressed to 4 bits per coordinate.
-//! let mut index = TurboQuantIndex::new(1536, 4);
+//! let mut index = TurboQuantIndex::new(1536, 4).unwrap();
 //!
 //! // `vectors` is a flat [f32] of length n * dim, `queries` likewise.
 //! let vectors: Vec<f32> = vec![0.0; 1536 * 10];
@@ -44,6 +44,7 @@ pub mod rotation;
 pub mod search;
 
 pub use error::AddError;
+pub use error::ConstructError;
 pub use id_map::IdMapIndex;
 
 use std::path::Path;
@@ -110,11 +111,15 @@ impl TurboQuantIndex {
     /// Construct an index with a known dimensionality. The dim is locked
     /// at construction; subsequent [`Self::add`] / [`Self::add_2d`] calls
     /// must match.
-    pub fn new(dim: usize, bit_width: usize) -> Self {
-        assert!((2..=4).contains(&bit_width), "bit_width must be 2, 3, or 4");
-        assert!(dim % 8 == 0, "dim must be a multiple of 8");
+    pub fn new(dim: usize, bit_width: usize) -> Result<Self, ConstructError> {
+        if !(2..=4).contains(&bit_width) {
+            return Err(ConstructError::InvalidBitWidth(bit_width));
+        }
+        if dim == 0 || dim % 8 != 0 {
+            return Err(ConstructError::InvalidDim(dim));
+        }
 
-        Self {
+        Ok(Self {
             dim: Some(dim),
             bit_width,
             n_vectors: 0,
@@ -123,15 +128,17 @@ impl TurboQuantIndex {
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
-        }
+        })
     }
 
     /// Construct an empty index without committing to a dimensionality.
     /// The dim is inferred and locked on the first [`Self::add_2d`] call
     /// (or [`Self::add`] if the caller wires dim in separately).
-    pub fn new_lazy(bit_width: usize) -> Self {
-        assert!((2..=4).contains(&bit_width), "bit_width must be 2, 3, or 4");
-        Self {
+    pub fn new_lazy(bit_width: usize) -> Result<Self, ConstructError> {
+        if !(2..=4).contains(&bit_width) {
+            return Err(ConstructError::InvalidBitWidth(bit_width));
+        }
+        Ok(Self {
             dim: None,
             bit_width,
             n_vectors: 0,
@@ -140,7 +147,7 @@ impl TurboQuantIndex {
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
-        }
+        })
     }
 
     /// Add a flat batch of vectors. `dim` must be set (either eagerly at
