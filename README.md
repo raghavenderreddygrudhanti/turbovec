@@ -17,6 +17,7 @@ turbovec is a Rust vector index with Python bindings, built on Google Research's
 
 - **No codebook training.** Add vectors, they're indexed. No data-dependent calibration, no rebuilds as the corpus grows.
 - **Faster than FAISS.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 12–20% on ARM and match-or-beat it on x86.
+- **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
 
 Building RAG where privacy, memory, or latency matters? **You're in the right place.**
@@ -56,13 +57,39 @@ index.write("my_index.tvim")
 loaded = IdMapIndex.load("my_index.tvim")
 ```
 
+### Hybrid retrieval (filtered search)
+
+Restrict results to a candidate set produced by another system (SQL, BM25, ACL, time window, …):
+
+```python
+import numpy as np
+from turbovec import IdMapIndex
+
+idx = IdMapIndex(dim=1536, bit_width=4)
+idx.add_with_ids(vectors, ids)
+
+# Stage 1: external system narrows to candidate ids.
+allowed = np.array(db.execute("SELECT id FROM docs WHERE tenant=?", (t,)).fetchall(),
+                   dtype=np.uint64)
+
+# Stage 2: dense rerank within the candidate set.
+scores, ids = idx.search(query, k=10, allowlist=allowed)
+```
+
+Filtering happens inside the SIMD kernel at 32-vector block granularity: blocks with no allowed slots are short-circuited before any LUT lookup or scoring work, and individual non-allowed slots inside scored blocks are dropped at heap-insert. Selective allowlists (small fraction of the index allowed) therefore avoid most of the SIMD cost rather than paying it and discarding the result afterwards.
+
+The output length is `min(k, len(allowed))` — when the allowlist is smaller than `k` you get exactly `len(allowed)` results rather than padded fallbacks.
+
 See [`docs/api.md`](docs/api.md) for the full reference.
 
 ### Framework integrations
 
-- [LangChain](docs/integrations/langchain.md) — `pip install turbovec[langchain]`
-- [LlamaIndex](docs/integrations/llama_index.md) — `pip install turbovec[llama-index]`
-- [Haystack](docs/integrations/haystack.md) — `pip install turbovec[haystack]`
+Drop-in replacements for the in-tree reference vector / document stores in each framework. Same public surface, same persistence semantics, same retriever and pipeline wiring — swap the import and keep your pipeline.
+
+- [LangChain](docs/integrations/langchain.md) — `pip install turbovec[langchain]` · replaces `langchain_core.vectorstores.InMemoryVectorStore`
+- [LlamaIndex](docs/integrations/llama_index.md) — `pip install turbovec[llama-index]` · replaces `llama_index.core.vector_stores.SimpleVectorStore`
+- [Haystack](docs/integrations/haystack.md) — `pip install turbovec[haystack]` · replaces `haystack.document_stores.in_memory.InMemoryDocumentStore`
+- [Agno](docs/integrations/agno.md) — `pip install turbovec[agno]` · replaces `agno.vectordb.lancedb.LanceDb`
 
 ## Rust
 
@@ -103,7 +130,7 @@ TurboQuant vs FAISS `IndexPQ` (LUT256, nbits=8) — the paper's Section 4.4 base
 
 ![Recall d=3072](docs/recall_d3072.svg)
 
-Across OpenAI d=1536 and d=3072, TurboQuant and FAISS are within 0–1 point at R@1 and both converge to 1.0 by k=4–8. GloVe d=200 is a harder regime — at low dim the asymptotic Beta assumption is looser, and our TurboQuant trails FAISS by 3–6 points at R@1 there, closing by k≈16–32.
+Across OpenAI d=1536 and d=3072, TurboQuant beats FAISS by 0.4–3.4 points at R@1 across 2-bit and 4-bit, and both converge to 1.0 by k=4. GloVe d=200 is the harder regime — at low dim the asymptotic Beta assumption is looser. TurboQuant beats FAISS by 0.3 points at 4-bit and trails by 1.2 points at 2-bit at R@1, both closing to FAISS by k≈16.
 
 **A note on baselines.** We compare against FAISS `IndexPQ` (LUT256, nbits=8, float32 LUT) because it's the default production-grade PQ most users would reach for. This is a stronger baseline than the custom u8-LUT PQ in the [TurboQuant paper](https://arxiv.org/abs/2504.19874) — FAISS uses a higher-precision LUT at scoring time and k-means++ for codebook training. We reproduce the paper's TurboQuant numbers on OpenAI d=1536 / d=3072 and hit similar numbers to other community reference implementations on low-dim embeddings (see [`turboquant-py`](https://pypi.org/project/turboquant-py/) at d=384). The visible gap on GloVe reflects FAISS being a strong baseline, not a TurboQuant implementation issue.
 
@@ -145,9 +172,13 @@ Each vector is a direction on a high-dimensional hypersphere. TurboQuant compres
 
 **4. Bit-pack.** Each coordinate is now a small integer (0-3 for 2-bit, 0-15 for 4-bit). Pack these tightly into bytes. A 1536-dim vector goes from 6,144 bytes (FP32) to 384 bytes (2-bit). That's 16x compression.
 
+**5. Length-renormalized scoring.** Scalar quantization systematically underestimates inner products — the reconstructed unit direction is a little shorter than the original. We compute one scalar per vector at encode time — the inner product of the rotated unit vector with its own centroid reconstruction — and store `||v|| / ⟨u, x̂⟩` alongside each compressed vector. The search kernel multiplies the per-candidate score by this scalar before heap insertion, turning the inner-product estimator from downward-biased into unbiased at zero search-time cost and zero extra storage. The recall gain shows up most at low bit widths, where the quantization shrinkage is largest.
+
+Encoding cost: one extra `d`-dimensional dot product per vector to compute `⟨u, x̂⟩`. On 1M vectors at d=1536 this is sub-second of additional encode time — a one-shot price paid at ingest, not at query.
+
 **Search.** Instead of decompressing every database vector, we rotate the query once into the same domain and score directly against the codebook values. The scoring kernel uses SIMD intrinsics (NEON on ARM, AVX-512BW on modern x86 with an AVX2 fallback) with nibble-split lookup tables for maximum throughput.
 
-The paper proves this achieves distortion within a factor of 2.7x of the information-theoretic lower bound (Shannon's distortion-rate limit). You cannot do much better for a given number of bits.
+The Lloyd-Max codebook achieves distortion within a factor of 2.7x of the information-theoretic lower bound (Shannon's distortion-rate limit); the length-renormalization step removes the residual bias the Lloyd-Max codebook introduces on the inner-product estimator itself.
 
 ## Building
 
@@ -201,4 +232,5 @@ python3 benchmarks/create_diagrams.py
 ## References
 
 - [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (ICLR 2026) -- the paper this implements
+- [RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search](https://arxiv.org/abs/2405.12497) (SIGMOD 2024) -- the source of the per-vector length-renormalization correction adapted in step 5
 - [FAISS Fast accumulation of PQ and AQ codes](https://github.com/facebookresearch/faiss/wiki/Fast-accumulation-of-PQ-and-AQ-codes-(FastScan)) -- turbovec's x86 SIMD kernel adapts FastScan's pack layout, nibble-LUT scoring, and u16 accumulator strategy

@@ -15,9 +15,9 @@
 //! ```no_run
 //! use turbovec::IdMapIndex;
 //!
-//! let mut index = IdMapIndex::new(1536, 4);
+//! let mut index = IdMapIndex::new(1536, 4).unwrap();
 //! let vectors: Vec<f32> = vec![0.0; 1536 * 3];
-//! index.add_with_ids(&vectors, &[1001, 1002, 1003]);
+//! index.add_with_ids(&vectors, &[1001, 1002, 1003]).unwrap();
 //!
 //! let queries: Vec<f32> = vec![0.0; 1536];
 //! let (scores, ids) = index.search(&queries, 3);
@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::io;
-use crate::TurboQuantIndex;
+use crate::{AddError, ConstructError, TurboQuantIndex};
 
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 pub struct IdMapIndex {
@@ -52,49 +52,98 @@ pub struct IdMapIndex {
 }
 
 impl IdMapIndex {
-    pub fn new(dim: usize, bit_width: usize) -> Self {
-        Self {
-            inner: TurboQuantIndex::new(dim, bit_width),
+    /// Construct an id-map index with a known dim. The dim is locked at
+    /// construction.
+    pub fn new(dim: usize, bit_width: usize) -> Result<Self, ConstructError> {
+        Ok(Self {
+            inner: TurboQuantIndex::new(dim, bit_width)?,
             slot_to_id: Vec::new(),
             id_to_slot: HashMap::new(),
-        }
+        })
+    }
+
+    /// Construct an empty id-map index without committing to a dim. The
+    /// dim is inferred and locked on the first [`Self::add_with_ids_2d`]
+    /// call.
+    pub fn new_lazy(bit_width: usize) -> Result<Self, ConstructError> {
+        Ok(Self {
+            inner: TurboQuantIndex::new_lazy(bit_width)?,
+            slot_to_id: Vec::new(),
+            id_to_slot: HashMap::new(),
+        })
     }
 
     /// Add `n = vectors.len() / dim` vectors with the given external ids.
+    /// Requires the inner index's dim to already be set (eager constructor
+    /// or a previous lazy add).
     ///
-    /// Panics if `ids.len() != n`, if any id is already present in the
-    /// index, or if `ids` contains duplicates within this call.
-    pub fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) {
-        let dim = self.inner.dim();
-        let n = vectors.len() / dim;
-        assert_eq!(
-            vectors.len(),
-            n * dim,
-            "vector buffer length {} not a multiple of dim {}",
-            vectors.len(),
-            dim,
+    /// Returns the same errors as
+    /// [`Self::add_with_ids_2d`]. Panics only if the inner index is still
+    /// in lazy/uninitialized state — that signals API misuse (use
+    /// `add_with_ids_2d` on a lazy index), not bad input.
+    pub fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), AddError> {
+        let dim = self.inner.dim_opt().expect(
+            "IdMapIndex dim is not set; use add_with_ids_2d(vectors, dim, ids) \
+             on the first add or construct with IdMapIndex::new(dim, bit_width)",
         );
-        assert_eq!(
-            ids.len(),
-            n,
-            "expected {n} ids, got {}",
-            ids.len(),
-        );
+        self.add_with_ids_2d(vectors, dim, ids)
+    }
 
-        // Reserve first so that a partial failure is impossible.
+    /// Add `vectors` of dimensionality `dim` with the given external ids.
+    /// On a lazy index this locks the dim; on an already-dim'd index
+    /// `dim` must match.
+    ///
+    /// This is the form bindings with shape information (e.g. the Python
+    /// binding receiving a 2D ndarray) should use, since a flat
+    /// `&[f32]` alone is ambiguous about shape.
+    ///
+    /// Returns
+    /// [`AddError::VectorBufferNotMultipleOfDim`](crate::AddError::VectorBufferNotMultipleOfDim),
+    /// [`AddError::IdsCountMismatch`](crate::AddError::IdsCountMismatch),
+    /// [`AddError::IdAlreadyPresent`](crate::AddError::IdAlreadyPresent),
+    /// or any error returned by
+    /// [`TurboQuantIndex::add_2d`](crate::TurboQuantIndex::add_2d).
+    pub fn add_with_ids_2d(
+        &mut self,
+        vectors: &[f32],
+        dim: usize,
+        ids: &[u64],
+    ) -> Result<(), AddError> {
+        if dim == 0 || vectors.len() % dim != 0 {
+            return Err(AddError::VectorBufferNotMultipleOfDim {
+                vectors_len: vectors.len(),
+                dim,
+            });
+        }
+        let n = vectors.len() / dim;
+        if ids.len() != n {
+            return Err(AddError::IdsCountMismatch {
+                expected: n,
+                got: ids.len(),
+            });
+        }
+
+        // Validate all ids up-front so a partial failure is impossible.
+        // Reject both ids already in the index and duplicates within
+        // this call.
+        let mut seen_this_call: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(n);
+        for &id in ids {
+            if self.id_to_slot.contains_key(&id) || !seen_this_call.insert(id) {
+                return Err(AddError::IdAlreadyPresent(id));
+            }
+        }
+
         self.id_to_slot.reserve(n);
         self.slot_to_id.reserve(n);
 
         let base_slot = self.inner.len();
         for (i, &id) in ids.iter().enumerate() {
-            let slot = base_slot + i;
-            if self.id_to_slot.insert(id, slot).is_some() {
-                panic!("id {id} already present in index");
-            }
+            self.id_to_slot.insert(id, base_slot + i);
         }
         self.slot_to_id.extend_from_slice(ids);
 
-        self.inner.add(vectors);
+        self.inner.add_2d(vectors, dim)
     }
 
     /// Remove the vector with the given external id.
@@ -128,10 +177,43 @@ impl IdMapIndex {
     /// indices `qi * k .. (qi + 1) * k` in both arrays. Number of rows
     /// is `queries.len() / dim`.
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
-        let res = self.inner.search(queries, k);
-        // `res.k` may be smaller than the requested `k` if the index
-        // has fewer than `k` vectors.
-        let effective_k = res.k;
+        self.search_with_allowlist(queries, k, None)
+    }
+
+    /// Search restricted to the given `allowlist` of external ids.
+    ///
+    /// `allowlist`, when `Some`, restricts the returned top-`k` to ids in the
+    /// allowlist. The effective result count per query is
+    /// `min(k, allowlist.len())` (after de-duplication).
+    ///
+    /// Panics if `allowlist` is empty or contains an id not currently
+    /// present in the index. Duplicate ids in the allowlist are accepted
+    /// and deduplicated.
+    ///
+    /// Passing `allowlist = None` is equivalent to [`Self::search`].
+    pub fn search_with_allowlist(
+        &self,
+        queries: &[f32],
+        k: usize,
+        allowlist: Option<&[u64]>,
+    ) -> (Vec<f32>, Vec<u64>) {
+        let mask_buf: Option<Vec<bool>> = allowlist.map(|ids| {
+            assert!(!ids.is_empty(), "allowlist is empty");
+            let mut mask = vec![false; self.inner.len()];
+            for &id in ids {
+                let slot = match self.id_to_slot.get(&id) {
+                    Some(&s) => s,
+                    None => panic!("id {id} in allowlist is not present in index"),
+                };
+                mask[slot] = true;
+            }
+            mask
+        });
+
+        let res = self
+            .inner
+            .search_with_mask(queries, k, mask_buf.as_deref());
+
         let mut ids = Vec::with_capacity(res.indices.len());
         for &slot in &res.indices {
             // Inner returns i64 slot indices. Convert via slot_to_id.
@@ -143,7 +225,6 @@ impl IdMapIndex {
             let id = self.slot_to_id[slot as usize];
             ids.push(id);
         }
-        let _ = effective_k; // keep `k` in the returned vec length
         (res.scores, ids)
     }
 
@@ -160,8 +241,16 @@ impl IdMapIndex {
         self.slot_to_id.is_empty()
     }
 
+    /// Vector dimensionality, or `0` if the index is lazy and hasn't
+    /// seen an add yet (matches [`TurboQuantIndex::dim`] semantics).
     pub fn dim(&self) -> usize {
         self.inner.dim()
+    }
+
+    /// Vector dimensionality as an [`Option`], where `None` means the
+    /// index is lazy and uncommitted.
+    pub fn dim_opt(&self) -> Option<usize> {
+        self.inner.dim_opt()
     }
 
     pub fn bit_width(&self) -> usize {
@@ -177,22 +266,24 @@ impl IdMapIndex {
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
         io::write_id_map(
             path,
             self.inner.bit_width(),
-            self.inner.dim(),
+            self.inner.dim_opt().unwrap_or(0),
             self.inner.len(),
             self.inner.packed_codes(),
-            self.inner.norms(),
+            self.inner.scales(),
             &self.slot_to_id,
         )
     }
 
     /// Load a `.tvim` file previously written by [`Self::write`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, norms, slot_to_id) =
+        let (bit_width, dim, n_vectors, packed_codes, scales, slot_to_id) =
             io::load_id_map(path)?;
-        let inner = TurboQuantIndex::from_parts(dim, bit_width, n_vectors, packed_codes, norms);
+        let dim_opt = if dim == 0 { None } else { Some(dim) };
+        let inner = TurboQuantIndex::from_parts(dim_opt, bit_width, n_vectors, packed_codes, scales);
         let id_to_slot: HashMap<u64, usize> = slot_to_id
             .iter()
             .enumerate()

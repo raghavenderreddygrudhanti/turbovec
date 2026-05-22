@@ -5,8 +5,31 @@
 //! - NEON on ARM (sequential code layout)
 //! - AVX2 on x86 (FAISS-style perm0-interleaved layout)
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rayon::prelude::*;
 use crate::{BLOCK, FLUSH_EVERY};
+
+/// Cumulative count of 32-vector blocks short-circuited by the mask
+/// early-exit path. Incremented atomically by [`block_has_allowed`]
+/// and [`block_pair_has_allowed`] whenever a block (or pair) is skipped
+/// because no allowed slots fall within it.
+///
+/// Process-global. Tests sample before/after a single search to verify
+/// the skip path fires; production callers can read it for hybrid-
+/// retrieval telemetry. Reset is provided for test isolation.
+pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
+pub fn blocks_skipped_by_mask() -> u64 {
+    BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
+}
+
+/// Reset the block-skip counter. Tests call this before issuing a
+/// selective search to take a clean delta.
+pub fn reset_blocks_skipped_by_mask() {
+    BLOCKS_SKIPPED_BY_MASK.store(0, Ordering::Relaxed);
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn score_4bit_block_neon(
@@ -16,7 +39,7 @@ unsafe fn score_4bit_block_neon(
     n_byte_groups: usize,
     scale: f32,
     bias: f32,
-    norms: &[f32],
+    vec_scales: &[f32],
     base_vec: usize,
     n_vectors: usize,
     out: &mut [f32; BLOCK],
@@ -99,14 +122,14 @@ unsafe fn score_4bit_block_neon(
         }
     }
 
-    // Write 32 scores to output buffer, applying norms
+    // Write 32 scores to output buffer, applying vec_scales
     let end = (base_vec + BLOCK).min(n_vectors);
     let out_ptr = out.as_mut_ptr();
-    let norms_ptr = norms.as_ptr().add(base_vec);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
     if end - base_vec == BLOCK {
         for i in 0..8 {
-            let n = vld1q_f32(norms_ptr.add(i * 4));
+            let n = vld1q_f32(vec_scales_ptr.add(i * 4));
             vst1q_f32(out_ptr.add(i * 4), vmulq_f32(fa[i], n));
         }
     } else {
@@ -116,7 +139,7 @@ unsafe fn score_4bit_block_neon(
         }
         for lane in 0..BLOCK {
             *out_ptr.add(lane) = if lane < end - base_vec {
-                float_accum[lane] * *norms_ptr.add(lane)
+                float_accum[lane] * *vec_scales_ptr.add(lane)
             } else {
                 f32::NEG_INFINITY
             };
@@ -138,10 +161,11 @@ unsafe fn search_multi_query_avx2(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
-    norms: &[f32],
+    vec_scales: &[f32],
     n_vectors: usize,
     nq: usize,
     k: usize,
+    mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
     heap_indices: &mut [Vec<u32>],
     heap_sizes: &mut [usize],
@@ -151,18 +175,24 @@ unsafe fn search_multi_query_avx2(
     use std::arch::x86_64::*;
 
     let n_blocks = (n_vectors + BLOCK - 1) / BLOCK;
-    let mask = _mm256_set1_epi8(0x0F);
+    // SIMD nibble mask; named distinctly from the `mask: Option<&[u64]>`
+    // function parameter (the slot allowlist) to avoid shadowing inside
+    // the loops below where we test the slot mask.
+    let nibble_mask = _mm256_set1_epi8(0x0F);
     let codes_base = blocked_codes.as_ptr();
 
     for b in 0..n_blocks {
         let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            continue;
+        }
         let mut accus = [[_mm256_setzero_si256(); 4]; 4];
 
         for g in 0..n_byte_groups {
             let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
             let codes_v = _mm256_loadu_si256(cp as *const __m256i);
-            let clo = _mm256_and_si256(codes_v, mask);
-            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), mask);
+            let clo = _mm256_and_si256(codes_v, nibble_mask);
+            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
 
             for qi in 0..4 {
                 let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
@@ -176,7 +206,7 @@ unsafe fn search_multi_query_avx2(
         }
 
         let end = (base_vec + BLOCK).min(n_vectors);
-        let norms_ptr = norms.as_ptr().add(base_vec);
+        let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
         for qi in 0..nq {
             let v_scale = _mm256_set1_ps(scales[qi]);
@@ -204,7 +234,7 @@ unsafe fn search_multi_query_avx2(
             if end - base_vec == BLOCK {
                 for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
                     let scored = _mm256_fmadd_ps(v_scale, *f, v_bias);
-                    let n = _mm256_loadu_ps(norms_ptr.add(i * 8));
+                    let n = _mm256_loadu_ps(vec_scales_ptr.add(i * 8));
                     _mm256_storeu_ps(bp.add(i * 8), _mm256_mul_ps(scored, n));
                 }
             } else {
@@ -212,7 +242,7 @@ unsafe fn search_multi_query_avx2(
                     _mm256_storeu_ps(bp.add(i * 8), _mm256_fmadd_ps(v_scale, *f, v_bias));
                 }
                 for lane in 0..(end - base_vec) {
-                    block_out[lane] *= *norms_ptr.add(lane);
+                    block_out[lane] *= *vec_scales_ptr.add(lane);
                 }
                 for lane in (end - base_vec)..BLOCK {
                     block_out[lane] = f32::NEG_INFINITY;
@@ -227,6 +257,9 @@ unsafe fn search_multi_query_avx2(
 
             if *sz < k {
                 for lane in 0..(end - base_vec) {
+                    if let Some(m) = mask {
+                        if !mask_allows(m, base_vec + lane) { continue; }
+                    }
                     let score = block_out[lane];
                     if *sz < k {
                         hs[*sz] = score;
@@ -258,6 +291,9 @@ unsafe fn search_multi_query_avx2(
 
                     let chunk_end = (chunk_start + 8).min(end - base_vec);
                     for lane in chunk_start..chunk_end {
+                        if let Some(m) = mask {
+                            if !mask_allows(m, base_vec + lane) { continue; }
+                        }
                         let score = block_out[lane];
                         if score > *hmin {
                             hs[*hmi] = score;
@@ -304,10 +340,11 @@ unsafe fn search_multi_query_avx512bw(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
-    norms: &[f32],
+    vec_scales: &[f32],
     n_vectors: usize,
     nq: usize,
     k: usize,
+    mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
     heap_indices: &mut [Vec<u32>],
     heap_sizes: &mut [usize],
@@ -326,6 +363,14 @@ unsafe fn search_multi_query_avx512bw(
     for p in 0..n_block_pairs {
         let b0 = p * 2;
         let b1 = b0 + 1;
+
+        // Pair-level early exit: each 64-vector pair aligns to a single
+        // u64 mask word, so when the whole word is zero we can skip the
+        // entire pair (no SIMD scoring, no epilogue) without disturbing
+        // top-k correctness — masked slots never appear in results today.
+        if !block_pair_has_allowed(mask, b0 * BLOCK) {
+            continue;
+        }
 
         // 4 queries × 4 zmm accumulators each. Each zmm holds 32 u16 values:
         // lower 256 bits = block b0's state, upper 256 bits = block b1's.
@@ -426,8 +471,15 @@ unsafe fn search_multi_query_avx512bw(
             let b = b0 + which_block;
             let base_vec = b * BLOCK;
             if base_vec >= n_vectors { break; }
+            // Per-block skip within the pair: we can't avoid the joint
+            // SIMD scoring across both halves of the zmm accumulator, but
+            // we can skip the float decode + heap update for a block
+            // whose mask half is zero.
+            if !block_has_allowed(mask, base_vec) {
+                continue;
+            }
             let end = (base_vec + BLOCK).min(n_vectors);
-            let norms_ptr = norms.as_ptr().add(base_vec);
+            let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
             // Extract this block's 256-bit half from each zmm accumulator.
             // Unrolled over which_block so the extract immediate is const.
@@ -453,11 +505,12 @@ unsafe fn search_multi_query_avx512bw(
                 base_vec,
                 end,
                 n_byte_groups,
-                norms_ptr,
+                vec_scales_ptr,
                 scales,
                 biases,
                 nq,
                 k,
+                mask,
                 heap_scores,
                 heap_indices,
                 heap_sizes,
@@ -472,6 +525,9 @@ unsafe fn search_multi_query_avx512bw(
     if bulk_blocks < n_blocks {
         let b = bulk_blocks;
         let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            return;
+        }
         let mut accus = [[_mm256_setzero_si256(); 4]; 4];
 
         for g in 0..n_byte_groups {
@@ -492,17 +548,18 @@ unsafe fn search_multi_query_avx512bw(
         }
 
         let end = (base_vec + BLOCK).min(n_vectors);
-        let norms_ptr = norms.as_ptr().add(base_vec);
+        let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
         avx2_block_epilogue(
             &mut accus,
             base_vec,
             end,
             n_byte_groups,
-            norms_ptr,
+            vec_scales_ptr,
             scales,
             biases,
             nq,
             k,
+            mask,
             heap_scores,
             heap_indices,
             heap_sizes,
@@ -524,11 +581,12 @@ unsafe fn avx2_block_epilogue(
     base_vec: usize,
     end: usize,
     n_byte_groups: usize,
-    norms_ptr: *const f32,
+    vec_scales_ptr: *const f32,
     scales: &[f32],
     biases: &[f32],
     nq: usize,
     k: usize,
+    mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
     heap_indices: &mut [Vec<u32>],
     heap_sizes: &mut [usize],
@@ -565,10 +623,10 @@ unsafe fn avx2_block_epilogue(
         let end_lane = end - base_vec;
         let (s0, s1, s2, s3) = if end_lane == BLOCK {
             (
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f0, v_bias), _mm256_loadu_ps(norms_ptr)),
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f1, v_bias), _mm256_loadu_ps(norms_ptr.add(8))),
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f2, v_bias), _mm256_loadu_ps(norms_ptr.add(16))),
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f3, v_bias), _mm256_loadu_ps(norms_ptr.add(24))),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f0, v_bias), _mm256_loadu_ps(vec_scales_ptr)),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f1, v_bias), _mm256_loadu_ps(vec_scales_ptr.add(8))),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f2, v_bias), _mm256_loadu_ps(vec_scales_ptr.add(16))),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f3, v_bias), _mm256_loadu_ps(vec_scales_ptr.add(24))),
             )
         } else {
             (
@@ -613,6 +671,9 @@ unsafe fn avx2_block_epilogue(
                     let bit = m.trailing_zeros() as usize;
                     m &= m - 1;
                     let lane = chunk * 8 + bit;
+                    if let Some(am) = mask {
+                        if !mask_allows(am, base_vec + lane) { continue; }
+                    }
                     let score = block_out[lane];
                     // Re-check: earlier lanes in this block may have raised
                     // *hmin above what the SIMD compare saw.
@@ -630,7 +691,7 @@ unsafe fn avx2_block_epilogue(
             continue;
         }
 
-        // Fallback: heap-fill phase (*sz < k) or tail block where norms
+        // Fallback: heap-fill phase (*sz < k) or tail block where vec_scales
         // still need per-lane scalar multiply. Materialize block_out and
         // run the existing fill / chunk-scan logic.
         let mut block_out = [0.0f32; BLOCK];
@@ -642,7 +703,7 @@ unsafe fn avx2_block_epilogue(
 
         if end_lane != BLOCK {
             for lane in 0..end_lane {
-                block_out[lane] *= *norms_ptr.add(lane);
+                block_out[lane] *= *vec_scales_ptr.add(lane);
             }
             for lane in end_lane..BLOCK {
                 block_out[lane] = f32::NEG_INFINITY;
@@ -651,6 +712,9 @@ unsafe fn avx2_block_epilogue(
 
         if *sz < k {
             for lane in 0..end_lane {
+                if let Some(am) = mask {
+                    if !mask_allows(am, base_vec + lane) { continue; }
+                }
                 let score = block_out[lane];
                 if *sz < k {
                     hs[*sz] = score;
@@ -682,6 +746,9 @@ unsafe fn avx2_block_epilogue(
 
                 let chunk_end = (chunk_start + 8).min(end_lane);
                 for lane in chunk_start..chunk_end {
+                    if let Some(am) = mask {
+                        if !mask_allows(am, base_vec + lane) { continue; }
+                    }
                     let score = block_out[lane];
                     if score > *hmin {
                         hs[*hmi] = score;
@@ -708,7 +775,7 @@ unsafe fn score_4query_block_neon(
     n_byte_groups: usize,
     scales: [f32; 4],
     biases: [f32; 4],
-    norms: &[f32],
+    vec_scales: &[f32],
     base_vec: usize,
     n_vectors: usize,
     rows: [*mut f32; 4],
@@ -775,15 +842,15 @@ unsafe fn score_4query_block_neon(
         }
     }
 
-    // Write with norms
+    // Write with vec_scales
     let end = (base_vec + BLOCK).min(n_vectors);
-    let norms_ptr = norms.as_ptr().add(base_vec);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
     for q in 0..4 {
         let rp = rows[q].add(base_vec);
         if end - base_vec == BLOCK {
             for i in 0..8 {
-                let n = vld1q_f32(norms_ptr.add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
                 vst1q_f32(rp.add(i * 4), vmulq_f32(fa[q][i], n));
             }
         } else {
@@ -792,7 +859,7 @@ unsafe fn score_4query_block_neon(
                 vst1q_f32(buf.as_mut_ptr().add(i * 4), fa[q][i]);
             }
             for lane in 0..(end - base_vec) {
-                *rp.add(lane) = buf[lane] * *norms_ptr.add(lane);
+                *rp.add(lane) = buf[lane] * *vec_scales_ptr.add(lane);
             }
         }
     }
@@ -902,22 +969,90 @@ fn build_query_neon_lut_from_slice(
     QueryNeonLut { uint8_luts, scale, bias }
 }
 
+/// Slot-allowlist bitmask: packed little-endian, bit `i` set iff slot `i` is
+/// allowed. Caller guarantees `len * 64 >= n_vectors`. Bits at index `>=
+/// n_vectors` are ignored.
+#[inline(always)]
+pub(crate) fn mask_allows(mask: &[u64], slot: usize) -> bool {
+    // Safety: caller validates mask length against n_vectors before reaching
+    // any kernel; we never query past it in scoring loops.
+    (mask[slot >> 6] >> (slot & 63)) & 1 != 0
+}
+
+/// Block-level early-exit predicate: true iff at least one slot in the
+/// 32-vector block starting at `base_vec` is allowed by `mask`. Returns
+/// true unconditionally when no mask is present, so the scoring kernel
+/// only short-circuits when a mask is supplied.
+///
+/// `base_vec` is always a multiple of [`BLOCK`] (= 32) and the slot bitmap
+/// is packed at 64 slots per `u64` word, so the relevant 32-bit window is
+/// either the low or high half of a single word.
+#[inline(always)]
+pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
+    match mask {
+        None => true,
+        Some(m) => {
+            let word = m[base_vec >> 6];
+            let bit_offset = base_vec & 63;
+            let allowed = ((word >> bit_offset) & 0xFFFF_FFFF) != 0;
+            if !allowed {
+                BLOCKS_SKIPPED_BY_MASK.fetch_add(1, Ordering::Relaxed);
+            }
+            allowed
+        }
+    }
+}
+
+/// Pair-level early-exit predicate for the AVX-512BW kernel which scores
+/// two adjacent 32-vector blocks per zmm iteration. The 64-vector pair
+/// aligns to a single `u64` word, so a zero word means neither block has
+/// allowed slots and the entire SIMD pair can be skipped.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize) -> bool {
+    match mask {
+        None => true,
+        Some(m) => {
+            let allowed = m[base_vec_pair >> 6] != 0;
+            if !allowed {
+                // A pair-level skip short-circuits two 32-vector blocks.
+                BLOCKS_SKIPPED_BY_MASK.fetch_add(2, Ordering::Relaxed);
+            }
+            allowed
+        }
+    }
+}
+
 /// Full search: rotation + LUT build + scoring + heap top-k.
-/// Returns (scores_flat, indices_flat) each of length nq * k.
+///
+/// `mask`: optional packed bitset over slots (one bit per vector,
+/// little-endian within each u64). When `Some`, only slots with their bit set
+/// contribute to the top-k. The returned per-query result count is
+/// `min(k, popcount(mask))`.
+///
+/// Returns (scores_flat, indices_flat) each of length nq * effective_k.
 pub fn search(
     queries: &[f32],    // (nq, dim) row-major
     nq: usize,
     rotation: &[f32],   // (dim, dim) row-major
     blocked_codes: &[u8],
     centroids: &[f32],
-    norms: &[f32],
+    vec_scales: &[f32],
     bits: usize,
     dim: usize,
     n_vectors: usize,
     n_blocks: usize,
     k: usize,
+    mask: Option<&[u64]>,
 ) -> (Vec<f32>, Vec<i64>) {
-    let k = k.min(n_vectors);
+    let n_allowed = match mask {
+        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
+        None => n_vectors,
+    };
+    let k = k.min(n_allowed);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let n_byte_groups = dim / (8 / bits);
 
     // Batched rotation: q_rot = queries @ rotation^T via a single GEMM.
@@ -990,11 +1125,18 @@ pub fn search(
                     ];
                     for block_idx in 0..n_blocks {
                         let base_vec = block_idx * BLOCK;
+                        if !block_has_allowed(mask, base_vec) {
+                            // Mask leaves `scores_flat` at NEG_INFINITY for these
+                            // slots, so the per-query top-k scan below ignores them
+                            // and the skip is correctness-preserving for all 4
+                            // queries in the batch.
+                            continue;
+                        }
                         let block_offset = block_idx * n_byte_groups * BLOCK;
                         unsafe {
                             score_4query_block_neon(
                                 blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, norms, base_vec, n_vectors, rows,
+                                scales, biases, vec_scales, base_vec, n_vectors, rows,
                             );
                         }
                     }
@@ -1006,13 +1148,16 @@ pub fn search(
                         let row_ptr = rows[qi_off];
                         for block_idx in 0..n_blocks {
                             let base_vec = block_idx * BLOCK;
+                            if !block_has_allowed(mask, base_vec) {
+                                continue;
+                            }
                             let block_offset = block_idx * n_byte_groups * BLOCK;
                             let end = (base_vec + BLOCK).min(n_vectors);
                             let mut block_out = [0.0f32; BLOCK];
                             unsafe {
                                 score_4bit_block_neon(
                                     blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
-                                    qlut.scale, qlut.bias, norms, base_vec, n_vectors, &mut block_out,
+                                    qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
                                 );
                                 for lane in 0..(end - base_vec) {
                                     *row_ptr.add(base_vec + lane) = block_out[lane];
@@ -1033,6 +1178,9 @@ pub fn search(
                         let mut heap_min = f32::NEG_INFINITY;
                         let mut heap_mi = 0usize;
                         for (i, &s) in row.iter().enumerate() {
+                            if let Some(m) = mask {
+                                if !mask_allows(m, i) { continue; }
+                            }
                             if heap_sz < k {
                                 heap_s[heap_sz] = s;
                                 heap_i[heap_sz] = i as u32;
@@ -1113,16 +1261,16 @@ pub fn search(
                     if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
                         search_multi_query_avx512bw(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, norms, n_vectors,
-                            batch_nq, k,
+                            n_byte_groups, vec_scales, n_vectors,
+                            batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
                     } else if is_x86_feature_detected!("avx2") {
                         search_multi_query_avx2(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, norms, n_vectors,
-                            batch_nq, k,
+                            n_byte_groups, vec_scales, n_vectors,
+                            batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
@@ -1162,10 +1310,16 @@ pub fn search(
 
                 for b in 0..n_blocks {
                     let base_vec = b * BLOCK;
+                    if !block_has_allowed(mask, base_vec) {
+                        continue;
+                    }
                     let block_offset = b * n_byte_groups * BLOCK;
                     for lane in 0..BLOCK {
                         let vi = base_vec + lane;
                         if vi >= n_vectors { break; }
+                        if let Some(m) = mask {
+                            if !mask_allows(m, vi) { continue; }
+                        }
                         // Total bias is applied once; per-sub-table zero-points
                         // are already folded into qlut.bias at LUT build time.
                         let mut score = qlut.bias;
@@ -1176,7 +1330,7 @@ pub fn search(
                             score += qlut.scale * qlut.uint8_luts[g * 32 + hi] as f32;
                             score += qlut.scale * qlut.uint8_luts[g * 32 + 16 + lo] as f32;
                         }
-                        score *= norms[vi];
+                        score *= vec_scales[vi];
                         if heap_sz < k {
                             heap_s[heap_sz] = score; heap_i[heap_sz] = vi as u32; heap_sz += 1;
                             if heap_sz == k {
